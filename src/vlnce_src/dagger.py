@@ -103,7 +103,11 @@ if __name__ == "__main__":
         args.DistributedDataParallel = False
         args.batchSize = real_bachsize
         
-        model_wrapper = TravelModelWrapper(model_args=model_args, data_args=data_args)
+        if args.policy == 'compact_uav':
+            from src.model_wrapper.compact_uav import CompactUAVModelWrapper
+            model_wrapper = CompactUAVModelWrapper(model_args=model_args, data_args=data_args)
+        else:
+            model_wrapper = TravelModelWrapper(model_args=model_args, data_args=data_args)
         
         assist = Assist(always_help=True, use_gt=True)
         

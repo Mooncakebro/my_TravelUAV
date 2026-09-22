@@ -17,6 +17,7 @@ class CommonArguments:
     run_type: str = field(default="train", metadata={"help": "run_type in [collect, train, eval]"})
     collect_type: str = field(default="dagger", metadata={"help": "collect_type in [dagger]"})
     name: str = field(default='default', metadata={"help": 'experiment name'})
+    policy: str = field(default='travelllm', metadata={"help": "policy wrapper in [travelllm, compact_uav]"})
 
     maxInput: int = field(default=500, metadata={"help": "max input instruction"})
     maxWaypoints: int = field(default=500, metadata={"help": 'max action sequence'})

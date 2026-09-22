@@ -1,0 +1,276 @@
+"""
+COMPACT-UAV closed-loop wrapper — drop-in replacement for TravelModelWrapper.
+
+Same public interface (prepare_inputs / run / predict_done / eval) so
+src/vlnce_src/eval.py and dagger.py can switch policies with --policy.
+
+Differences from TravelModelWrapper:
+  - the MLLM is CompactUAVModel (Qwen3-VL + side memory + waypoint head);
+  - prompts are built with the Qwen3-VL chat template (5 view images);
+  - COMPACT memory is carried across steps within an episode and reset when
+    an episode slot is replaced or truncated;
+  - the previous executed waypoint (raw 4-dim model output) is fed back as
+    the FiLM-GRU control input.
+
+The trajectory predictor, GroundingDINO stop monitor, and all post-processing
+are reused unchanged from src/model_wrapper/utils/travel_util.py.
+
+NOTE(env): this imports travel_util lazily because it pulls in llamavid
+(traj predictor vision tower). Run eval in an env that has both the
+LLaMA-UAV deps and transformers>=4.57 (Qwen3-VL).
+"""
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.append(str(Path(str(os.getcwd())).resolve()))
+sys.path.append(str(Path(__file__).resolve().parents[2] / 'Model' / 'COMPACT-UAV'))
+
+from src.model_wrapper.base_model import BaseModelWrapper
+from src.vlnce_src.dino_monitor_online import DinoMonitor
+
+
+class CompactUAVModelWrapper(BaseModelWrapper):
+    def __init__(self, model_args, data_args):
+        from compact_uav_model import CompactUAVModel
+        from src.model_wrapper.utils.travel_util import (
+            load_traj_model, prepare_data_to_traj_model, transform_to_world,
+            rotation_matrix_from_vector, transform_point,
+        )
+        from transformers import CLIPImageProcessor
+
+        self._traj_utils = {
+            'prepare_data_to_traj_model': prepare_data_to_traj_model,
+            'transform_to_world': transform_to_world,
+        }
+        self._rotation_matrix_from_vector = rotation_matrix_from_vector
+        self._transform_point = transform_point
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = CompactUAVModel.from_pretrained(model_args.model_path)
+        self.model.to(self.device)
+        self.tokenizer = self.model.tokenizer
+        self.processor = self.model.processor
+
+        self.traj_model = load_traj_model(model_args)
+        self.traj_model.to(dtype=torch.bfloat16, device=self.device)
+        self.image_processor = CLIPImageProcessor.from_pretrained(
+            model_args.image_processor)
+
+        self.model_args = model_args
+        self.data_args = data_args
+        self.dino_moinitor = None
+
+        # per-slot episode state (memory carried across steps)
+        self._ep_ids = None        # id() of each slot's episode list
+        self._ep_lens = None       # last seen length per slot
+        self._memory = None        # (memory_states, variance_states, e_prev)
+        self._prev_wp = None       # [B, 4] raw previous waypoint per slot
+
+    # ── prompt construction (mirrors travel_util.prepare_data_to_inputs) ──
+
+    def _build_prompt(self, episode, target_point, assist_notice):
+        instruction = episode[-1]['instruction']
+        if assist_notice is not None:
+            stage = assist_notice
+        else:
+            stage = 'cruise' if len(episode) > 20 else 'take off'
+
+        rot = np.array(episode[0]['sensors']['imu']["rotation"])
+        pos = np.array(episode[0]['sensors']['state']['position'])
+        deltas = [np.array(src['sensors']['state']['position']) - pos
+                  for src in episode if 'rgb' in src]
+        history_waypoint = np.array([rot.T @ d for d in deltas])
+
+        target_rel = np.array(rot.T @ (target_point - pos))
+        rotation_to_target = self._rotation_matrix_from_vector(
+            target_rel[0], target_rel[1])
+        history_waypoint = self._transform_point(history_waypoint,
+                                                 rotation_to_target)
+
+        if len(history_waypoint) >= 2:
+            delta = history_waypoint[-1] - history_waypoint[-2]
+        else:
+            delta = np.array([0, 0, -4.5])
+        delta = delta / (np.linalg.norm(delta) + 1e-8)
+        delta_str = ','.join(str(round(v, 1)) for v in delta)
+        cur_str = ','.join(str(round(v, 1)) for v in history_waypoint[-1])
+
+        prompt_text = (
+            f'Stage:{stage}\n\n'
+            f'Previous displacement:{delta_str}\n\n'
+            f'Current position:{cur_str}\n\n'
+            f'Current image (in order: front, left, right, rear, down):\n\n'
+            f'Instruction:{instruction}'
+        )
+        return prompt_text, rotation_to_target
+
+    def _process_one(self, prompt_text, images):
+        """Qwen3-VL processor call for a single step. images: 5 HWC arrays."""
+        from PIL import Image
+        pil_images = [Image.fromarray(im) for im in images]
+        head, instruction = prompt_text.split(
+            'Current image (in order: front, left, right, rear, down):')
+        content = [{'type': 'text',
+                    'text': head + 'Current image (in order: front, left, '
+                                   'right, rear, down):'}]
+        content += [{'type': 'image'} for _ in pil_images]
+        content.append({'type': 'text',
+                        'text': '\n\nInstruction:' + instruction.split(
+                            'Instruction:')[-1]})
+        messages = [{'role': 'user', 'content': content}]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        return self.processor(text=[text], images=pil_images,
+                              return_tensors='pt', padding=True)
+
+    # ── memory state management ──
+
+    def _update_episode_tracking(self, episodes):
+        """Reset memory rows for slots whose episode was replaced/truncated."""
+        B = len(episodes)
+        reset_mask = [True] * B
+        if self._ep_ids is not None and len(self._ep_ids) == B:
+            reset_mask = [
+                id(episodes[i]) != self._ep_ids[i]
+                or len(episodes[i]) < self._ep_lens[i]
+                for i in range(B)
+            ]
+        self._ep_ids = [id(ep) for ep in episodes]
+        self._ep_lens = [len(ep) for ep in episodes]
+
+        if self._memory is None or self._memory[0][0].shape[0] != B:
+            self._memory = self.model.init_memory(B, self.device) + (None,)
+            self._prev_wp = None
+            return
+
+        if any(reset_mask):
+            memory_states, variance_states, e_prev = self._memory
+            fresh_m, fresh_p = self.model.init_memory(B, self.device)
+            mask = torch.tensor(reset_mask, device=self.device)
+            for l in range(len(memory_states)):
+                memory_states[l] = torch.where(
+                    mask.view(B, 1, 1), fresh_m[l], memory_states[l])
+                variance_states[l] = torch.where(
+                    mask.view(B, 1), fresh_p[l], variance_states[l])
+            self._memory = (memory_states, variance_states, None)
+            if self._prev_wp is not None:
+                for i, r in enumerate(reset_mask):
+                    if r:
+                        self._prev_wp[i] = 0.0
+
+    # ── BaseModelWrapper interface ──
+
+    def prepare_inputs(self, episodes, target_positions, assist_notices=None):
+        self._update_episode_tracking(episodes)
+
+        processed, rot_to_targets = [], []
+        for i, ep in enumerate(episodes):
+            prompt_text, rot = self._build_prompt(
+                ep, target_positions[i],
+                assist_notices[i] if assist_notices is not None else None)
+            images = None
+            for src in ep[::-1]:
+                if 'rgb' in src:
+                    images = src['rgb']
+                    break
+            processed.append(self._process_one(prompt_text, images))
+            rot_to_targets.append(rot)
+
+        # batch: right-pad input_ids to longest, concat pixel_values
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        max_len = max(p['input_ids'].shape[1] for p in processed)
+        B = len(processed)
+
+        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+        mm_ids = None
+        if all(p.get('mm_token_type_ids') is not None for p in processed):
+            mm_ids = torch.zeros((B, max_len), dtype=torch.long)
+        pixel_values = []
+        image_grid_thw = []
+        for b, p in enumerate(processed):
+            n = p['input_ids'].shape[1]
+            input_ids[b, :n] = p['input_ids'][0]
+            attention_mask[b, :n] = p['attention_mask'][0]
+            if mm_ids is not None:
+                mm_ids[b, :n] = p['mm_token_type_ids'][0]
+            pixel_values.append(p['pixel_values'])
+            image_grid_thw.append(p['image_grid_thw'])
+
+        # append the sentinel slot (same position for the whole batch)
+        sentinel_col = torch.full((B, 1), pad_id, dtype=torch.long)
+        input_ids = torch.cat([input_ids, sentinel_col], dim=1)
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones(B, 1, dtype=torch.long)], dim=1)
+        if mm_ids is not None:
+            mm_ids = torch.cat(
+                [mm_ids, torch.zeros(B, 1, dtype=torch.long)], dim=1)
+        sentinel_mask = torch.zeros(B, max_len + 1, dtype=torch.bool)
+        sentinel_mask[:, -1] = True
+        observation_mask = attention_mask.clone()
+        observation_mask[:, -1] = 0
+
+        inputs = {
+            'input_ids': input_ids.to(self.device),
+            'attention_mask': attention_mask.to(self.device),
+            'sentinel_mask': sentinel_mask.to(self.device),
+            'observation_mask': observation_mask.to(self.device),
+            'pixel_values': torch.cat(pixel_values, dim=0).to(self.device),
+            'image_grid_thw': torch.cat(image_grid_thw, dim=0).to(self.device),
+        }
+        if mm_ids is not None:
+            inputs['mm_token_type_ids'] = mm_ids.to(self.device)
+
+        return inputs, rot_to_targets
+
+    def run(self, inputs, episodes, rot_to_targets):
+        memory_states, variance_states, e_prev = self._memory
+        prev_wp = None
+        if self._prev_wp is not None:
+            prev_wp = self._prev_wp.to(self.device)
+
+        predicted, new_m, new_v, new_e = self.model.predict_waypoint(
+            memory_states=memory_states,
+            variance_states=variance_states,
+            e_prev_list=e_prev,
+            prev_waypoints=prev_wp,
+            **inputs,
+        )
+        self._memory = (new_m, new_v, new_e)
+        self._prev_wp = predicted.detach().float().cpu()
+
+        # renormalize: dir * distance (same as TravelModelWrapper)
+        waypoints = predicted.cpu().to(dtype=torch.float32).numpy()
+        waypoints_new = []
+        for waypoint in waypoints:
+            waypoint_new = (waypoint[:3]
+                            / (1e-6 + np.linalg.norm(waypoint[:3]))
+                            * waypoint[3])
+            waypoints_new.append(waypoint_new)
+        waypoints_new = np.array(waypoints_new)
+
+        traj_inputs = self._traj_utils['prepare_data_to_traj_model'](
+            episodes, waypoints_new, self.image_processor, rot_to_targets)
+        refined = self.traj_model(traj_inputs, None)
+        refined = refined.cpu().to(dtype=torch.float32).numpy()
+        return self._traj_utils['transform_to_world'](refined, episodes)
+
+    def eval(self):
+        self.model.eval()
+        self.traj_model.eval()
+
+    def predict_done(self, episodes, object_infos):
+        prediction_dones = []
+        if self.dino_moinitor is None:
+            self.dino_moinitor = DinoMonitor.get_instance()
+        for i in range(len(episodes)):
+            prediction_dones.append(
+                self.dino_moinitor.get_dino_results(episodes[i],
+                                                    object_infos[i]))
+        return prediction_dones
