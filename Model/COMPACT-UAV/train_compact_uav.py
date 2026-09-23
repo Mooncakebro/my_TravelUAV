@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import os
 import random
 import sys
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -87,6 +89,22 @@ def detach_states(states):
     return [s.detach() if torch.is_tensor(s) else None for s in states]
 
 
+def init_distributed():
+    """Initialize torchrun state, while keeping ordinary single-GPU use intact."""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size <= 1:
+        return False, 0, 1, 0
+
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+    if not dist.is_initialized():
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend, init_method='env://')
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return True, rank, world_size, local_rank
+
+
 def main():
     args = parse_args()
     if args.dry_run:
@@ -97,9 +115,13 @@ def main():
         args.grad_accum_steps = 1
         print('[train] DRY RUN mode')
 
+    distributed, rank, world_size, local_rank = init_distributed()
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     config = CompactConfig.from_args(
         base_model_name=args.base_model_name,
@@ -114,26 +136,40 @@ def main():
     )
 
     if args.resume_from:
-        model = CompactUAVModel.from_pretrained(
+        core_model = CompactUAVModel.from_pretrained(
             args.resume_from, config_override=config)
     else:
-        model = CompactUAVModel(config, use_memory=not args.no_memory)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.train()
+        core_model = CompactUAVModel(config, use_memory=not args.no_memory)
+    device = (torch.device('cuda', local_rank)
+              if torch.cuda.is_available() else torch.device('cpu'))
+    core_model.to(device)
+    core_model.train()
 
-    counts = model.count_parameters()
-    print(f"[train] params: base={counts['base']/1e9:.2f}B "
-          f"new={counts['new']/1e6:.1f}M "
-          f"(memory={counts['memory']/1e6:.1f}M lora={counts['lora']/1e6:.1f}M)")
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel
+        model = DistributedDataParallel(
+            core_model,
+            device_ids=[local_rank] if device.type == 'cuda' else None,
+            output_device=local_rank if device.type == 'cuda' else None,
+            find_unused_parameters=False,
+        )
+    else:
+        model = core_model
+
+    counts = core_model.count_parameters()
+    if rank == 0:
+        print(f"[train] params: base={counts['base']/1e9:.2f}B "
+              f"new={counts['new']/1e6:.1f}M "
+              f"(memory={counts['memory']/1e6:.1f}M lora={counts['lora']/1e6:.1f}M) "
+              f"world_size={world_size}")
 
     # ── Optimizer: LoRA params at lr, new modules at memory_learning_rate ──
-    llm_trainable = [p for p in model.llm.parameters() if p.requires_grad]
-    new_modules = [model.side_memories, model.action_embed,
-                   model.waypoint_emb, model.waypoints_fc,
-                   model.waypoints_output, model.prev_action_mlp]
+    llm_trainable = [p for p in core_model.llm.parameters() if p.requires_grad]
+    new_modules = [core_model.side_memories, core_model.action_embed,
+                   core_model.waypoint_emb, core_model.waypoints_fc,
+                   core_model.waypoints_output, core_model.prev_action_mlp]
     new_params = [p for m in new_modules for p in m.parameters()]
-    new_params.append(model.null_action)
+    new_params.append(core_model.null_action)
     param_groups = []
     if llm_trainable:
         param_groups.append({'params': llm_trainable, 'lr': args.learning_rate})
@@ -150,8 +186,8 @@ def main():
         args.data_path, args.dataset_path,
         max_episode_steps=args.max_episode_steps,
     )
-    processor = model.processor
-    tokenizer = model.tokenizer
+    processor = core_model.processor
+    tokenizer = core_model.tokenizer
     assert processor is not None and tokenizer is not None
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -159,11 +195,17 @@ def main():
     micro_step = 0   # chunks since last optimizer step
     running = {}
 
-    for epoch in range(args.epochs):
+    # Episodes are the state boundary. Shard whole episodes so no memory state
+    # is ever shared between ranks; DDP.join handles unequal episode lengths.
+    ddp_context = model.join() if distributed else nullcontext()
+    with ddp_context:
+      for epoch in range(args.epochs):
         order = list(range(len(dataset)))
-        random.shuffle(order)
+        random.Random(args.seed + epoch).shuffle(order)
         if args.max_episodes:
             order = order[:args.max_episodes]
+        if distributed:
+            order = order[rank::world_size]
 
         for ep_idx in order:
             episode = dataset[ep_idx]
@@ -220,28 +262,34 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-                    if global_step % args.log_steps == 0:
+                    if rank == 0 and global_step % args.log_steps == 0:
                         n = args.log_steps * args.grad_accum_steps
                         msg = ' '.join(
                             f'{k}={v / n:.4f}' for k, v in sorted(running.items()))
                         print(f'[train] epoch {epoch} step {global_step} {msg}',
                               flush=True)
                         running = {}
-                    if not args.dry_run and global_step % args.save_steps == 0:
+                    if (rank == 0 and not args.dry_run
+                            and global_step % args.save_steps == 0):
                         ckpt = os.path.join(args.output_dir,
                                             f'checkpoint-{global_step}')
-                        model.save_pretrained(ckpt)
+                        core_model.save_pretrained(ckpt)
 
             # episode boundary: drop memory (next episode starts fresh)
             memory_states = variance_states = e_prev_list = None
 
-        if not args.dry_run:
-            model.save_pretrained(
+        if rank == 0 and not args.dry_run:
+            core_model.save_pretrained(
                 os.path.join(args.output_dir, f'epoch-{epoch}'))
 
-    if not args.dry_run:
-        model.save_pretrained(os.path.join(args.output_dir, 'final'))
-    print('[train] done')
+    if distributed:
+        dist.barrier()
+    if rank == 0 and not args.dry_run:
+        core_model.save_pretrained(os.path.join(args.output_dir, 'final'))
+    if rank == 0:
+        print('[train] done')
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

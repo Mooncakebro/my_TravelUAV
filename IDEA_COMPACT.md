@@ -132,8 +132,8 @@ from the raw PNGs with the Qwen processor (new tool, §5 step 2).**
 4. **Previous-action input**: replace "mean-pool previous action text tokens" with a small MLP
    embedding the **previous 4-dim waypoint** (direction+distance) into the FiLM-GRU control space.
    - Training: teacher forcing with GT previous waypoint.
-   - Inference: the actually-executed action — first refined waypoint of the flown 7-point path
-     (or realized odometry displacement). Episode start: learned null-action embedding / zeros.
+   - Inference: the predicted 4-dim waypoint itself is the action for now (trajectory refinement
+     is downstream and is not fed back). Episode start: learned null-action embedding / zeros.
 5. **Trajectory predictor**: keep frozen, LLM-agnostic (input = front camera + 3-dim waypoint).
    Reuse released checkpoint `wangxiangyu0814/traveluav-traj-model` initially; optionally retrain on
    COMPACT-UAV's waypoint distribution later (`scripts/traj/train_traj_completion.sh`).
@@ -204,13 +204,14 @@ python tools/generate_merged_json.py --root_dir /home/spc/memory_arena/TravelUAV
 
 ```bash
 cd /home/spc/memory_arena/TravelUAV/Model/COMPACT-UAV
-python -u train_compact_uav.py \
+torchrun --standalone --nproc_per_node=8 train_compact_uav.py \
     --base_model_name Qwen/Qwen3-VL-2B-Instruct \
     --data_path ../../data/uav_dataset/trainset.json \
     --dataset_path ../../data/raw_dataset/extracted \
     --lora_rank 32 --lora_alpha 64 \
     --chunk_size 8 \
     --output_dir work_dirs/compact-uav-2b-lora32
+# For a single GPU, use `python -u` instead of `torchrun`.
 # smoke test first: add --dry_run (2 episodes, 4 steps, no saving)
 # ablations: --no_memory (reset memory every step), --train_base (dense SFT)
 ```

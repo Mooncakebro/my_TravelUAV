@@ -180,7 +180,7 @@ class CompactUAVModel(JAMELCompactWrapper):
             loss_nll = result["loss_nll"].float()
             loss_mem = torch.stack([
                 m.float().pow(2).sum() for m in result["new_memory"]
-            ]).mean() / max(len(result["new_memory"]), 1)
+            ]).mean()
 
             total = (
                 loss_wp

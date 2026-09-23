@@ -9,8 +9,8 @@ Differences from TravelModelWrapper:
   - prompts are built with the Qwen3-VL chat template (5 view images);
   - COMPACT memory is carried across steps within an episode and reset when
     an episode slot is replaced or truncated;
-  - the previous executed waypoint (raw 4-dim model output) is fed back as
-    the FiLM-GRU control input.
+  - the previous predicted 4-dim waypoint (the policy action, before trajectory
+    refinement) is fed back as the FiLM-GRU control input.
 
 The trajectory predictor, GroundingDINO stop monitor, and all post-processing
 are reused unchanged from src/model_wrapper/utils/travel_util.py.
@@ -68,12 +68,15 @@ class CompactUAVModelWrapper(BaseModelWrapper):
         self._ep_ids = None        # id() of each slot's episode list
         self._ep_lens = None       # last seen length per slot
         self._memory = None        # (memory_states, variance_states, e_prev)
-        self._prev_wp = None       # [B, 4] raw previous waypoint per slot
+        self._prev_wp = None       # [B, 4] previous policy action per slot
 
     # ── prompt construction (mirrors travel_util.prepare_data_to_inputs) ──
 
     def _build_prompt(self, episode, target_point, assist_notice):
-        instruction = episode[-1]['instruction']
+        # Training strips the dataset's literal <image> marker because Qwen's
+        # chat template inserts the actual image placeholders. Keep eval exact.
+        from dataset_uav import normalize_instruction
+        instruction = normalize_instruction(episode[-1]['instruction'])
         if assist_notice is not None:
             stage = assist_notice
         else:

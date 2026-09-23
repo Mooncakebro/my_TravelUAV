@@ -36,6 +36,14 @@ CAMERA_FOLDERS = ['frontcamera', 'leftcamera', 'rightcamera',
 CAMERA_NAMES = ['front', 'left', 'right', 'rear', 'down']
 
 
+def normalize_instruction(instruction: str) -> str:
+    """Use the same instruction text for merged-data training and live eval."""
+    text = str(instruction).strip()
+    while text.startswith('<image>'):
+        text = text[len('<image>'):].lstrip()
+    return text
+
+
 # ── Geometry helpers (identical to train_uav_notice.py / travel_util.py) ──
 
 def rotation_matrix_from_vector(x, y):
@@ -168,9 +176,7 @@ class UAVEpisodeDataset(Dataset):
         trajectory = np.asarray(merged['trajectory'], dtype=np.float64)
         index_list = merged['index']
         # instruction: strip the "<image>\n" prefix from the human turn
-        instruction = merged['conversations'][0]['value']
-        if instruction.startswith('<image>'):
-            instruction = instruction[len('<image>'):].strip()
+        instruction = normalize_instruction(merged['conversations'][0]['value'])
 
         x_t, y_t = trajectory[-1][0], trajectory[-1][1]
         rot_to_target = rotation_matrix_from_vector(x_t, y_t)
