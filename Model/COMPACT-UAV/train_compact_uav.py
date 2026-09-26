@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import json
 import os
 import random
 import sys
@@ -69,6 +70,12 @@ def parse_args():
     p.add_argument('--max_episode_steps', type=int, default=None)
     p.add_argument('--max_episodes', type=int, default=None,
                    help='debug: cap number of episodes per epoch')
+    p.add_argument('--eval_fraction', type=float, default=0.05,
+                   help='fraction of episodes held out for validation')
+    p.add_argument('--max_eval_episodes', type=int, default=None,
+                   help='debug: cap validation episodes')
+    p.add_argument('--eval_every', type=int, default=1,
+                   help='run validation every N epochs')
     p.add_argument('--max_length', type=int, default=8192)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--log_steps', type=int, default=10)
@@ -87,6 +94,84 @@ def detach_states(states):
     if states is None:
         return None
     return [s.detach() if torch.is_tensor(s) else None for s in states]
+
+
+def split_episode_indices(n_episodes, fraction, seed):
+    """Deterministic episode-level split shared by every DDP rank."""
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError('--eval_fraction must be in [0, 1)')
+    if n_episodes < 2 or fraction == 0.0:
+        return list(range(n_episodes)), []
+    n_eval = max(1, int(round(n_episodes * fraction)))
+    n_eval = min(n_eval, n_episodes - 1)
+    order = list(range(n_episodes))
+    random.Random(seed).shuffle(order)
+    eval_set = set(order[:n_eval])
+    return [i for i in range(n_episodes) if i not in eval_set], order[:n_eval]
+
+
+def _model_inputs(inputs, device):
+    return {
+        k: (v.to(device) if torch.is_tensor(v) else v)
+        for k, v in inputs.items()
+        if k in ('input_ids', 'attention_mask', 'sentinel_mask',
+                 'observation_mask', 'pixel_values', 'image_grid_thw',
+                 'mm_token_type_ids') and v is not None
+    }
+
+
+def _forward_step(model, step, processor, tokenizer, device, max_length,
+                  memory_states, variance_states, e_prev_list):
+    inputs = process_step(step, processor, tokenizer, max_length=max_length)
+    prev_wp = inputs['prev_waypoint']
+    if prev_wp is not None:
+        prev_wp = prev_wp.to(device)
+    out = model(
+        **_model_inputs(inputs, device),
+        prev_waypoints=prev_wp,
+        memory_states=memory_states,
+        variance_states=variance_states,
+        e_prev_list=e_prev_list,
+        waypoint_labels=inputs['waypoint_label'].to(device),
+    )
+    return out
+
+
+def evaluate(model, dataset, eval_indices, processor, tokenizer, device,
+             max_length, max_eval_episodes=None, distributed=False):
+    """Run deterministic episode-sharded validation and all-reduce its mean."""
+    model.eval()
+    indices = eval_indices
+    if max_eval_episodes is not None:
+        indices = indices[:max_eval_episodes]
+    if distributed:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        indices = indices[rank::world_size]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    count = torch.zeros((), device=device, dtype=torch.float64)
+    with torch.no_grad():
+        for ep_idx in indices:
+            episode = dataset[ep_idx]
+            if episode is None:
+                continue
+            memory_states = variance_states = e_prev_list = None
+            for step in episode['steps']:
+                out = _forward_step(
+                    model, step, processor, tokenizer, device, max_length,
+                    memory_states, variance_states, e_prev_list)
+                loss_sum += out['loss'].detach().to(torch.float64)
+                count += 1
+                memory_states = out['new_memory']
+                variance_states = out['new_variance']
+                e_prev_list = out['e_list']
+    if distributed:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    mean = (loss_sum / count.clamp_min(1.0)).item()
+    model.train()
+    return mean, int(count.item())
 
 
 def init_distributed():
@@ -113,6 +198,7 @@ def main():
         args.max_episode_steps = 4
         args.epochs = 1
         args.grad_accum_steps = 1
+        args.max_eval_episodes = 1
         print('[train] DRY RUN mode')
 
     distributed, rank, world_size, local_rank = init_distributed()
@@ -190,94 +276,122 @@ def main():
     tokenizer = core_model.tokenizer
     assert processor is not None and tokenizer is not None
 
+    train_indices, eval_indices = split_episode_indices(
+        len(dataset), args.eval_fraction, args.seed)
+    if args.max_episodes:
+        # The cap applies to training only; validation remains a held-out set.
+        train_indices = train_indices[:args.max_episodes]
+    if rank == 0:
+        print(f'[data] train episodes={len(train_indices)} '
+              f'validation episodes={len(eval_indices)} '
+              f'(fraction={args.eval_fraction:.3f})')
+
     os.makedirs(args.output_dir, exist_ok=True)
     global_step = 0  # optimizer steps
     micro_step = 0   # chunks since last optimizer step
+    best_val_loss = float('inf')
     running = {}
 
-    # Episodes are the state boundary. Shard whole episodes so no memory state
-    # is ever shared between ranks; DDP.join handles unequal episode lengths.
-    ddp_context = model.join() if distributed else nullcontext()
-    with ddp_context:
-      for epoch in range(args.epochs):
-        order = list(range(len(dataset)))
+    for epoch in range(args.epochs):
+        order = list(train_indices)
         random.Random(args.seed + epoch).shuffle(order)
-        if args.max_episodes:
-            order = order[:args.max_episodes]
         if distributed:
             order = order[rank::world_size]
 
-        for ep_idx in order:
-            episode = dataset[ep_idx]
-            if episode is None:
-                continue
-            steps = episode['steps']
+        # Episodes are the state boundary. Shard whole episodes so no memory
+        # state is shared between ranks. join() handles unequal episode counts.
+        ddp_context = model.join() if distributed else nullcontext()
+        with ddp_context:
 
-            memory_states, variance_states, e_prev_list = None, None, None
-            for chunk_start in range(0, len(steps), args.chunk_size):
-                chunk = steps[chunk_start:chunk_start + args.chunk_size]
-                chunk_loss = 0.0
-                for step in chunk:
-                    inputs = process_step(step, processor, tokenizer,
-                                          max_length=args.max_length)
-                    model_inputs = {
-                        k: (v.to(device) if torch.is_tensor(v) else v)
-                        for k, v in inputs.items()
-                        if k in ('input_ids', 'attention_mask', 'sentinel_mask',
-                                 'observation_mask', 'pixel_values',
-                                 'image_grid_thw', 'mm_token_type_ids')
-                        and v is not None
-                    }
-                    prev_wp = inputs['prev_waypoint']
-                    if prev_wp is not None:
-                        prev_wp = prev_wp.to(device)
-                    out = model(
-                        **model_inputs,
-                        prev_waypoints=prev_wp,
-                        memory_states=memory_states,
-                        variance_states=variance_states,
-                        e_prev_list=e_prev_list,
-                        waypoint_labels=inputs['waypoint_label'].to(device),
-                    )
-                    chunk_loss = chunk_loss + out['loss'] / len(chunk)
-                    memory_states = out['new_memory']
-                    variance_states = out['new_variance']
-                    e_prev_list = out['e_list']
-                    for k, v in out['loss_dict'].items():
-                        running[k] = running.get(k, 0.0) + float(v) / len(chunk)
+            for ep_idx in order:
+                episode = dataset[ep_idx]
+                if episode is None:
+                    continue
+                steps = episode['steps']
 
-                chunk_loss.backward()
-                micro_step += 1
+                memory_states, variance_states, e_prev_list = None, None, None
+                for chunk_start in range(0, len(steps), args.chunk_size):
+                    chunk = steps[chunk_start:chunk_start + args.chunk_size]
+                    chunk_loss = 0.0
+                    for step in chunk:
+                        out = _forward_step(
+                            model, step, processor, tokenizer, device,
+                            args.max_length, memory_states, variance_states,
+                            e_prev_list)
+                        chunk_loss = chunk_loss + out['loss'] / len(chunk)
+                        memory_states = out['new_memory']
+                        variance_states = out['new_variance']
+                        e_prev_list = out['e_list']
+                        for k, v in out['loss_dict'].items():
+                            running[k] = (running.get(k, 0.0)
+                                          + float(v) / len(chunk))
 
-                # TBPTT: detach carried state at chunk boundary
-                memory_states = detach_states(memory_states)
-                variance_states = detach_states(variance_states)
-                e_prev_list = detach_states(e_prev_list)
+                    chunk_loss.backward()
+                    micro_step += 1
 
-                if micro_step % args.grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for g in param_groups for p in g['params']],
-                        args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
+                    # TBPTT: detach carried state at chunk boundary
+                    memory_states = detach_states(memory_states)
+                    variance_states = detach_states(variance_states)
+                    e_prev_list = detach_states(e_prev_list)
 
-                    if rank == 0 and global_step % args.log_steps == 0:
-                        n = args.log_steps * args.grad_accum_steps
-                        msg = ' '.join(
-                            f'{k}={v / n:.4f}' for k, v in sorted(running.items()))
-                        print(f'[train] epoch {epoch} step {global_step} {msg}',
+                    if micro_step % args.grad_accum_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for g in param_groups for p in g['params']],
+                            args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        global_step += 1
+
+                        if rank == 0 and global_step % args.log_steps == 0:
+                            n = args.log_steps * args.grad_accum_steps
+                            msg = ' '.join(
+                                f'{k}={v / n:.4f}'
+                                for k, v in sorted(running.items()))
+                            print(f'[train] epoch {epoch} step {global_step} {msg}',
+                                  flush=True)
+                            running = {}
+                        if (rank == 0 and not args.dry_run
+                                and global_step % args.save_steps == 0):
+                            ckpt = os.path.join(args.output_dir,
+                                                f'checkpoint-{global_step}')
+                            core_model.save_pretrained(ckpt)
+
+                # episode boundary: drop memory (next episode starts fresh)
+                memory_states = variance_states = e_prev_list = None
+
+        # Flush a final partial accumulation at the epoch boundary.
+        if micro_step % args.grad_accum_steps:
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in param_groups for p in g['params']],
+                args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            micro_step = 0
+
+        if distributed:
+            dist.barrier()
+        if (epoch + 1) % args.eval_every == 0 and eval_indices:
+            val_loss, val_count = evaluate(
+                model, dataset, eval_indices, processor, tokenizer, device,
+                args.max_length, args.max_eval_episodes, distributed)
+            if rank == 0:
+                print(f'[eval] epoch {epoch} loss={val_loss:.6f} '
+                      f'samples={val_count}', flush=True)
+                if not args.dry_run:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        core_model.save_pretrained(
+                            os.path.join(args.output_dir, 'best'))
+                        with open(os.path.join(args.output_dir,
+                                               'best_metrics.json'), 'w') as f:
+                            json.dump({'epoch': epoch, 'global_step': global_step,
+                                       'val_loss': val_loss,
+                                       'val_samples': val_count}, f, indent=2)
+                        print(f'[train] saved new best checkpoint at epoch {epoch}',
                               flush=True)
-                        running = {}
-                    if (rank == 0 and not args.dry_run
-                            and global_step % args.save_steps == 0):
-                        ckpt = os.path.join(args.output_dir,
-                                            f'checkpoint-{global_step}')
-                        core_model.save_pretrained(ckpt)
-
-            # episode boundary: drop memory (next episode starts fresh)
-            memory_states = variance_states = e_prev_list = None
-
+        if distributed:
+            dist.barrier()
         if rank == 0 and not args.dry_run:
             core_model.save_pretrained(
                 os.path.join(args.output_dir, f'epoch-{epoch}'))

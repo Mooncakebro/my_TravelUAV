@@ -25,7 +25,8 @@ identical action interface is the core experiment.
 | Simulator bridge | `airsim_plugin/AirVLNSimulatorServerTool.py`, `AirVLNSimulatorClientTool.py` | Hosts AirSim/Unreal envs; serves 5 RGB + 5 depth cameras @ 256×256; executes `moveOnPathAsync` (1 m/s, ForwardOnly, lookahead 3) |
 | Closed-loop env | `src/vlnce_src/env_uav.py`, `closeloop_util.py` | Episode loop, collision/stuck detection, success = stop within 20 m of target |
 | Assist module | `src/vlnce_src/assist.py` | "Stage:" prompt hints from depth rules / GroundingDINO / GT trajectory (`--always_help True --use_gt True` in eval) |
-| Policy wrapper | `src/model_wrapper/travel_llm.py` | LLM → 4-dim waypoint → traj model → 7 refined world-frame waypoints; DINO stop |
+| Policy wrapper | `src/model_wrapper/travel_llm.py` | Reference LLM → 4-dim waypoint → trajectory model → refined path; DINO stop |
+| COMPACT policy wrapper | `src/model_wrapper/compact_uav.py` | Qwen3-VL + COMPACT memory → raw 4-dim waypoint → direct world-frame action; DINO stop |
 | MLLM (to be replaced) | `Model/LLaMA-UAV/llamavid/model/language_model/llava_llama_uav.py` | `LlavaLlamaAttForCausalLM`: sentinel slot + waypoint regression head |
 | Trajectory predictor (kept) | `Model/LLaMA-UAV/llamavid/model/vis_traj_arch.py` | `VisionTrajectoryGenerator`: front camera + 3-dim waypoint → 7 future waypoints |
 | Data prep tools | `Model/LLaMA-UAV/tools/generate_merged_json.py`, `preprocess_image2tensor.py` | Build `merged_data.json` per episode; CLIP-preprocess images (EVA-specific, must be redone for Qwen) |
@@ -132,11 +133,13 @@ from the raw PNGs with the Qwen processor (new tool, §5 step 2).**
 4. **Previous-action input**: replace "mean-pool previous action text tokens" with a small MLP
    embedding the **previous 4-dim waypoint** (direction+distance) into the FiLM-GRU control space.
    - Training: teacher forcing with GT previous waypoint.
-   - Inference: the predicted 4-dim waypoint itself is the action for now (trajectory refinement
-     is downstream and is not fed back). Episode start: learned null-action embedding / zeros.
-5. **Trajectory predictor**: keep frozen, LLM-agnostic (input = front camera + 3-dim waypoint).
-   Reuse released checkpoint `wangxiangyu0814/traveluav-traj-model` initially; optionally retrain on
-   COMPACT-UAV's waypoint distribution later (`scripts/traj/train_traj_completion.sh`).
+   - Inference: the predicted 4-dim waypoint itself is the action. The current COMPACT wrapper
+     converts it directly to one world-frame target and bypasses trajectory refinement. Episode
+     start: learned null-action embedding / zeros.
+5. **Action execution (current experiment)**: use the predicted 4-dim waypoint directly. Convert
+   its target-frame direction + distance to one world-frame XYZ target and linearly sample that
+   endpoint for the simulator's five-point path API. The trajectory predictor is deliberately bypassed so train
+   and inference have the same action interface. It can be reintroduced only as a separate ablation.
 6. **Stop / assist / execution / metrics**: unchanged (GroundingDINO + assist module + AirSim client).
 
 ### Training data pipeline (new)
@@ -163,6 +166,7 @@ Model/COMPACT-UAV/
                                  # on the fly (NO EVA rgb_imgs.tensor needed)
   train_compact_uav.py           # TBPTT training entry (--dry_run for smoke tests)
   smoke_test.py                  # tiny-config end-to-end test (passed, see §9)
+  TRAINING_GUIDE.md               # DDP training and closed-loop evaluation commands
 src/model_wrapper/compact_uav.py # eval/DAgger wrapper (policy selector below)
 ```
 
@@ -219,13 +223,12 @@ torchrun --standalone --nproc_per_node=8 train_compact_uav.py \
 Requires an env with torch + transformers>=4.57 + peft (verified working in the
 `lerobot` conda env with `LD_LIBRARY_PATH=/home/spc/anaconda3/envs/lerobot/lib`).
 
-### 6.3 Trajectory predictor (stage 2)
+### 6.3 Trajectory predictor (reference policy only)
 
 ```bash
-# option A (start here): reuse released ckpt
+# The COMPACT-UAV policy currently bypasses this model. Keep it only for
+# reproducing the original TravelLLM baseline.
 hf download wangxiangyu0814/traveluav-traj-model --local-dir Model/LLaMA-UAV/work_dirs/traj_predictor_bs_128_drop_0.1_lr_5e-4
-# option B (later): retrain on COMPACT-UAV waypoint outputs
-bash Model/LLaMA-UAV/scripts/traj/train_traj_completion.sh
 ```
 
 ### 6.4 Closed-loop eval
@@ -242,10 +245,7 @@ CUDA_VISIBLE_DEVICES=0 python -u src/vlnce_src/eval.py \
     --always_help True --use_gt True --maxWaypoints 200 \
     --dataset_path data/raw_dataset/extracted \
     --eval_save_path data/eval_closeloop/compact_uav_test \
-    --model_path Model/COMPACT-UAV/work_dirs/compact-uav-2b-lora32/final \
-    --traj_model_path Model/LLaMA-UAV/work_dirs/traj_predictor_bs_128_drop_0.1_lr_5e-4 \
-    --vision_tower Model/LLaMA-UAV/model_zoo/LAVIS/eva_vit_g.pth \
-    --image_processor Model/LLaMA-UAV/llamavid/processor/clip-patch14-224 \
+    --model_path Model/COMPACT-UAV/work_dirs/compact-uav-2b-lora32/best \
     --eval_json_path data/uav_dataset/seen_valset.json \
     --map_spawn_area_json_path data/meta/map_spawnarea_info.json \
     --object_name_json_path data/meta/object_description.json \

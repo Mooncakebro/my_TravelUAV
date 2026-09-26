@@ -12,12 +12,14 @@ Differences from TravelModelWrapper:
   - the previous predicted 4-dim waypoint (the policy action, before trajectory
     refinement) is fed back as the FiLM-GRU control input.
 
-The trajectory predictor, GroundingDINO stop monitor, and all post-processing
-are reused unchanged from src/model_wrapper/utils/travel_util.py.
+The GroundingDINO stop monitor is reused unchanged. The trajectory predictor is
+intentionally bypassed: the predicted 4D waypoint is the policy action for this
+  experiment. AirSim requires a short XYZ path, so that one action is converted
+  to world coordinates and linearly sampled for the simulator's five-point API.
 
-NOTE(env): this imports travel_util lazily because it pulls in llamavid
-(traj predictor vision tower). Run eval in an env that has both the
-LLaMA-UAV deps and transformers>=4.57 (Qwen3-VL).
+NOTE(env): COMPACT-UAV evaluation needs the Qwen3-VL/PEFT stack and the
+existing AirSim/GroundingDINO runtime. It does not import the LLaMA-UAV
+trajectory predictor because that model is bypassed for this action ablation.
 """
 import os
 import sys
@@ -33,32 +35,29 @@ from src.model_wrapper.base_model import BaseModelWrapper
 from src.vlnce_src.dino_monitor_online import DinoMonitor
 
 
+def _rotation_matrix_from_vector(x, y):
+    v_x = np.asarray([x, y, 0.0], dtype=np.float64)
+    v_x /= np.linalg.norm(v_x) + 1e-12
+    v_y = np.asarray([-v_x[1], v_x[0], 0.0])
+    v_y /= np.linalg.norm(v_y) + 1e-12
+    return np.column_stack((v_x, v_y, [0.0, 0.0, 1.0]))
+
+
+def _transform_point(point, rotation_matrix):
+    return np.dot(point, rotation_matrix)
+
+
 class CompactUAVModelWrapper(BaseModelWrapper):
     def __init__(self, model_args, data_args):
         from compact_uav_model import CompactUAVModel
-        from src.model_wrapper.utils.travel_util import (
-            load_traj_model, prepare_data_to_traj_model, transform_to_world,
-            rotation_matrix_from_vector, transform_point,
-        )
-        from transformers import CLIPImageProcessor
-
-        self._traj_utils = {
-            'prepare_data_to_traj_model': prepare_data_to_traj_model,
-            'transform_to_world': transform_to_world,
-        }
-        self._rotation_matrix_from_vector = rotation_matrix_from_vector
-        self._transform_point = transform_point
+        self._rotation_matrix_from_vector = _rotation_matrix_from_vector
+        self._transform_point = _transform_point
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = CompactUAVModel.from_pretrained(model_args.model_path)
         self.model.to(self.device)
         self.tokenizer = self.model.tokenizer
         self.processor = self.model.processor
-
-        self.traj_model = load_traj_model(model_args)
-        self.traj_model.to(dtype=torch.bfloat16, device=self.device)
-        self.image_processor = CLIPImageProcessor.from_pretrained(
-            model_args.image_processor)
 
         self.model_args = model_args
         self.data_args = data_args
@@ -69,6 +68,7 @@ class CompactUAVModelWrapper(BaseModelWrapper):
         self._ep_lens = None       # last seen length per slot
         self._memory = None        # (memory_states, variance_states, e_prev)
         self._prev_wp = None       # [B, 4] previous policy action per slot
+        self.last_actions_4d = None # CPU [B, 4], useful for logging/evaluation
 
     # ── prompt construction (mirrors travel_util.prepare_data_to_inputs) ──
 
@@ -127,8 +127,18 @@ class CompactUAVModelWrapper(BaseModelWrapper):
         messages = [{'role': 'user', 'content': content}]
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        return self.processor(text=[text], images=pil_images,
-                              return_tensors='pt', padding=True)
+        inputs = self.processor(text=[text], images=pil_images,
+                                return_tensors='pt', padding=True)
+        # Keep the exact truncation/sentinel budget used by dataset_uav.py.
+        max_length = int(getattr(self.model.config, 'max_length', 8192))
+        if inputs['input_ids'].shape[1] > max_length - 1:
+            excess = inputs['input_ids'].shape[1] - (max_length - 1)
+            inputs['input_ids'] = inputs['input_ids'][:, excess:]
+            inputs['attention_mask'] = inputs['attention_mask'][:, excess:]
+            if inputs.get('mm_token_type_ids') is not None:
+                inputs['mm_token_type_ids'] = \
+                    inputs['mm_token_type_ids'][:, excess:]
+        return inputs
 
     # ── memory state management ──
 
@@ -248,25 +258,32 @@ class CompactUAVModelWrapper(BaseModelWrapper):
         self._memory = (new_m, new_v, new_e)
         self._prev_wp = predicted.detach().float().cpu()
 
-        # renormalize: dir * distance (same as TravelModelWrapper)
+        # The raw 4D output is the action. Convert its target-frame direction
+        # and distance into one world-frame XYZ target; do not invoke the
+        # downstream trajectory-refinement model in this policy.
         waypoints = predicted.cpu().to(dtype=torch.float32).numpy()
-        waypoints_new = []
-        for waypoint in waypoints:
-            waypoint_new = (waypoint[:3]
+        self.last_actions_4d = waypoints.copy()
+        world_paths = []
+        for waypoint, episode, rot_to_target in zip(
+                waypoints, episodes, rot_to_targets):
+            local_target = (waypoint[:3]
                             / (1e-6 + np.linalg.norm(waypoint[:3]))
                             * waypoint[3])
-            waypoints_new.append(waypoint_new)
-        waypoints_new = np.array(waypoints_new)
-
-        traj_inputs = self._traj_utils['prepare_data_to_traj_model'](
-            episodes, waypoints_new, self.image_processor, rot_to_targets)
-        refined = self.traj_model(traj_inputs, None)
-        refined = refined.cpu().to(dtype=torch.float32).numpy()
-        return self._traj_utils['transform_to_world'](refined, episodes)
+            rot_0 = np.asarray(episode[0]['sensors']['imu']['rotation'])
+            rot = np.asarray(episode[-1]['sensors']['imu']['rotation'])
+            pos = np.asarray(episode[-1]['sensors']['state']['position'])
+            # target-frame -> initial local frame -> current local frame.
+            current_target = rot.T @ rot_0 @ rot_to_target @ local_target
+            world_target = rot @ current_target + pos
+            # move_path_by_waypoints expects five points and indexes all of
+            # them. Linear interpolation is transport-only; the endpoint is
+            # still exactly the raw policy action.
+            world_paths.append(np.linspace(pos, world_target, 5,
+                                           dtype=np.float32))
+        return world_paths
 
     def eval(self):
         self.model.eval()
-        self.traj_model.eval()
 
     def predict_done(self, episodes, object_infos):
         prediction_dones = []

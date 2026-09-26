@@ -91,6 +91,11 @@ The file directory of environments is as follows:
 
 # Usage
 
+For the COMPACT-UAV Qwen3-VL policy, including the tested environment,
+multi-GPU `torchrun` command, deterministic 95/5 validation split, best-weight
+checkpointing, and direct-waypoint evaluation command, see
+[`Model/COMPACT-UAV/TRAINING_GUIDE.md`](Model/COMPACT-UAV/TRAINING_GUIDE.md).
+
 1. setup simulator env server
 
 Before running the simulations, ensure the AirSim environment server is properly configured.

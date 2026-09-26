@@ -10,7 +10,6 @@ import torch
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
 from utils.logger import logger
 
-from src.model_wrapper.travel_llm import TravelModelWrapper
 from src.model_wrapper.base_model import BaseModelWrapper
 from src.common.param import args, model_args, data_args
 from src.vlnce_src.env_uav import AirVLNENV
@@ -107,6 +106,7 @@ if __name__ == "__main__":
             from src.model_wrapper.compact_uav import CompactUAVModelWrapper
             model_wrapper = CompactUAVModelWrapper(model_args=model_args, data_args=data_args)
         else:
+            from src.model_wrapper.travel_llm import TravelModelWrapper
             model_wrapper = TravelModelWrapper(model_args=model_args, data_args=data_args)
         
         assist = Assist(always_help=True, use_gt=True)
